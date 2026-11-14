@@ -13,3 +13,7 @@ Why: The tool can still be built and checked here. Inventing a remote would not 
 Checklist: correctness, resources, untrusted input, errors, tests, security.
 
 Finding: an unpinned GitHub Action would make CI depend on a moving tag. Resolution: pin `actions/checkout` to `11bd71901bbe5b1630ceea73d27597364c9af683` and `actions/setup-go` to `d35c59abb061a4a6fb18e82ac0862c26744d6ab5` (tag v5.5.0). No second model was available to run `scripts/cross-review.sh`. This pass is the review checklist, not a claim that another provider ran.
+
+## 2026-11-13 phase 2 review
+
+Finding: a large or linked file could be read by mistake, including a secret outside the tree. Resolution: ReadFile uses Lstat, rejects symlinks, and rejects files over 1 MiB. JSON syntax errors return an error instead of an empty policy. No second model was available.
