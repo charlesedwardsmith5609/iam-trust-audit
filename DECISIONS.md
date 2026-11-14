@@ -25,3 +25,7 @@ Finding: the tool cannot know the home account, so a same-account ARN looks like
 ## 2026-11-13 phase 4 review
 
 Finding: a JSON report that echoed the policy could print an external id or a secret stored in a condition. Resolution: text and JSON include id, severity, file, statement index, and the fix hint only. No second model was available.
+
+## 2026-11-13 phase 5 review
+
+Finding: the README could be read as a claim that every Terraform trust policy is scanned. Resolution: the README repeats that jsonencode HCL is not parsed and that the home account is unknown. Checks were re-run on the committed tree. No second model was available.
