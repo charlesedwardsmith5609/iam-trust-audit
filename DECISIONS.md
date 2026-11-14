@@ -17,3 +17,7 @@ Finding: an unpinned GitHub Action would make CI depend on a moving tag. Resolut
 ## 2026-11-13 phase 2 review
 
 Finding: a large or linked file could be read by mistake, including a secret outside the tree. Resolution: ReadFile uses Lstat, rejects symlinks, and rejects files over 1 MiB. JSON syntax errors return an error instead of an empty policy. No second model was available.
+
+## 2026-11-13 phase 3 review
+
+Finding: the tool cannot know the home account, so a same-account ARN looks like a vendor. Resolution: every AWS account ARN on sts:AssumeRole is treated as cross-account. OIDC statements are not also flagged as vendors. The scaffold Go 1.22.2 stdlib failed govulncheck, so go.mod is 1.26.11. No second model was available.

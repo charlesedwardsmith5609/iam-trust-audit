@@ -1,0 +1,10 @@
+{
+  "Statement": {
+    "Effect": "Allow",
+    "Action": "sts:AssumeRole",
+    "Principal": {"AWS": "arn:aws:iam::111122223333:root"},
+    "Condition": {
+      "IpAddress": {"aws:SourceIp": "203.0.113.0/24"}
+    }
+  }
+}

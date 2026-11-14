@@ -1,0 +1,26 @@
+{
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": "sts:AssumeRole",
+      "Principal": {"AWS": "arn:aws:iam::111122223333:root"},
+      "Condition": {
+        "StringEquals": {
+          "sts:ExternalId": "vendor-external-id",
+          "aws:PrincipalOrgID": "o-abc1234567"
+        }
+      }
+    },
+    {
+      "Effect": "Allow",
+      "Action": "sts:AssumeRoleWithWebIdentity",
+      "Principal": {"Federated": "arn:aws:iam::123456789012:oidc-provider/token.actions.githubusercontent.com"},
+      "Condition": {
+        "StringEquals": {
+          "token.actions.githubusercontent.com:aud": "sts.amazonaws.com",
+          "token.actions.githubusercontent.com:sub": "repo:example-org/example-repo:ref:refs/heads/main"
+        }
+      }
+    }
+  ]
+}
