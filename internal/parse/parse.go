@@ -6,12 +6,92 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"sort"
 	"strings"
+	"syscall"
 )
 
-const MaxBytes = 1 << 20
+const (
+	MaxBytes = 1 << 20
+	maxDepth = 64
+)
+
+// readBounded opens path once, refuses anything but a regular file, and reads at
+// most MaxBytes. O_NOFOLLOW rejects a symlink as the last component; O_NONBLOCK
+// keeps open from hanging on a FIFO.
+func readBounded(path string) ([]byte, error) {
+	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	st, err := f.Stat()
+	if err != nil {
+		return nil, err
+	}
+	if !st.Mode().IsRegular() {
+		return nil, fmt.Errorf("%q is not a regular file", path)
+	}
+	b, err := io.ReadAll(io.LimitReader(f, MaxBytes+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(b) > MaxBytes {
+		return nil, fmt.Errorf("%q is larger than %d bytes", path, MaxBytes)
+	}
+	return b, nil
+}
+
+// checkJSON walks data once with a Decoder. It rejects duplicate object keys and
+// nesting deeper than maxDepth.
+func checkJSON(data []byte) error {
+	dec := json.NewDecoder(bytes.NewReader(data))
+	type frame struct {
+		object  bool
+		keys    map[string]bool
+		wantKey bool
+	}
+	var stack []frame
+	for {
+		tok, err := dec.Token()
+		if err == io.EOF {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		if n := len(stack); n > 0 && stack[n-1].object && stack[n-1].wantKey && tok != json.Delim('}') {
+			key, ok := tok.(string)
+			if !ok {
+				return fmt.Errorf("invalid object key %v", tok)
+			}
+			if stack[n-1].keys[key] {
+				return fmt.Errorf("duplicate key %q", key)
+			}
+			stack[n-1].keys[key] = true
+			stack[n-1].wantKey = false
+			continue
+		}
+		if d, ok := tok.(json.Delim); ok {
+			switch d {
+			case '{', '[':
+				if len(stack) >= maxDepth {
+					return fmt.Errorf("JSON nested deeper than %d levels", maxDepth)
+				}
+				stack = append(stack, frame{object: d == '{', keys: map[string]bool{}, wantKey: d == '{'})
+				continue
+			default:
+				stack = stack[:len(stack)-1]
+			}
+		}
+		// A value (scalar or closed container) ended; the next token in an object is a key.
+		if n := len(stack); n > 0 && stack[n-1].object {
+			stack[n-1].wantKey = true
+		}
+	}
+}
 
 // Statement is one trust statement with condition values flattened to strings.
 type Statement struct {
@@ -21,7 +101,14 @@ type Statement struct {
 	NotActions    []string
 	Principals    []Principal
 	NotPrincipals []Principal
-	Conditions    map[string]map[string][]string
+	Conditions    []Condition
+}
+
+// Condition is one operator/key pair with its values, in file order. Operator is as written.
+type Condition struct {
+	Operator string
+	Key      string
+	Values   []string
 }
 
 // Principal is one principal entry. Kind Any means the principal was "*".
@@ -58,19 +145,10 @@ type rawStatement struct {
 	Condition    json.RawMessage `json:"Condition"`
 }
 
-// ReadFile loads path. Symlinks and files over MaxBytes are errors.
+// ReadFile loads path. Non-regular files (including a symlink as the last path
+// component) and files over MaxBytes are errors.
 func ReadFile(path string) ([]Policy, error) {
-	info, err := os.Lstat(path)
-	if err != nil {
-		return nil, err
-	}
-	if info.Mode()&os.ModeSymlink != 0 {
-		return nil, fmt.Errorf("%s is a symlink", path)
-	}
-	if info.Size() > MaxBytes {
-		return nil, fmt.Errorf("%s is larger than %d bytes", path, MaxBytes)
-	}
-	data, err := os.ReadFile(path)
+	data, err := readBounded(path)
 	if err != nil {
 		return nil, err
 	}
@@ -100,6 +178,9 @@ func ReadFile(path string) ([]Policy, error) {
 // ParseJSON parses a trust policy or a role wrapper with AssumeRolePolicyDocument.
 func ParseJSON(file string, data []byte) (Policy, error) {
 	data = bytes.TrimSpace(data)
+	if err := checkJSON(data); err != nil {
+		return Policy{}, fmt.Errorf("invalid JSON: %w", err)
+	}
 	var probe rawDoc
 	if err := json.Unmarshal(data, &probe); err != nil {
 		return Policy{}, fmt.Errorf("invalid JSON: %w", err)
@@ -121,7 +202,10 @@ func ParseJSON(file string, data []byte) (Policy, error) {
 	if err := json.Unmarshal(body, &doc); err != nil {
 		return Policy{}, fmt.Errorf("invalid JSON: %w", err)
 	}
-	if len(doc.Statement) == 0 {
+	if err := checkJSON(body); err != nil {
+		return Policy{}, fmt.Errorf("invalid JSON: %w", err)
+	}
+	if len(doc.Statement) == 0 || string(doc.Statement) == "null" {
 		return Policy{}, fmt.Errorf("trust policy has no Statement")
 	}
 	var many []rawStatement
@@ -136,8 +220,26 @@ func ParseJSON(file string, data []byte) (Policy, error) {
 		}
 		many = []rawStatement{one}
 	}
+	if len(many) == 0 {
+		return Policy{}, fmt.Errorf("trust policy has an empty Statement")
+	}
 	out := Policy{File: file}
 	for i, raw := range many {
+		if len(raw.Effect)+len(raw.Action)+len(raw.NotAction)+len(raw.Principal)+len(raw.NotPrincipal)+len(raw.Condition) == 0 {
+			return Policy{}, fmt.Errorf("statement %d is empty", i)
+		}
+		actions, err := stringList(raw.Action, true)
+		if err != nil {
+			return Policy{}, fmt.Errorf("statement %d Action: %w", i, err)
+		}
+		notActions, err := stringList(raw.NotAction, true)
+		if err != nil {
+			return Policy{}, fmt.Errorf("statement %d NotAction: %w", i, err)
+		}
+		conds, err := conditions(raw.Condition)
+		if err != nil {
+			return Policy{}, fmt.Errorf("statement %d Condition: %w", i, err)
+		}
 		princ, err := principals(raw.Principal)
 		if err != nil {
 			return Policy{}, fmt.Errorf("statement %d Principal: %w", i, err)
@@ -149,11 +251,11 @@ func ParseJSON(file string, data []byte) (Policy, error) {
 		out.Statements = append(out.Statements, Statement{
 			Index:         i,
 			Effect:        raw.Effect,
-			Actions:       stringList(raw.Action),
-			NotActions:    stringList(raw.NotAction),
+			Actions:       actions,
+			NotActions:    notActions,
 			Principals:    princ,
 			NotPrincipals: notPrinc,
-			Conditions:    conditions(raw.Condition),
+			Conditions:    conds,
 		})
 	}
 	return out, nil
@@ -233,19 +335,51 @@ func resourceName(line string) (string, bool) {
 	return parts[1] + "." + parts[3], true
 }
 
-func stringList(raw json.RawMessage) []string {
-	if len(raw) == 0 {
-		return nil
+// stringList decodes a string, or a list of strings, as text. Unless onlyStrings
+// is set, numbers and bools are also accepted (condition values).
+func stringList(raw json.RawMessage, onlyStrings bool) ([]string, error) {
+	if len(raw) == 0 || string(raw) == "null" {
+		return nil, nil
 	}
-	var one string
-	if err := json.Unmarshal(raw, &one); err == nil {
-		return []string{one}
+	value, err := decodeValue(raw)
+	if err != nil {
+		return nil, err
 	}
-	var many []string
-	if err := json.Unmarshal(raw, &many); err == nil {
-		return many
+	switch v := value.(type) {
+	case []any:
+		out := make([]string, 0, len(v))
+		for _, item := range v {
+			text, ok := scalarText(item, onlyStrings)
+			if !ok {
+				return nil, fmt.Errorf("list entry %v is not a string, number or bool", item)
+			}
+			out = append(out, text)
+		}
+		return out, nil
+	default:
+		text, ok := scalarText(v, onlyStrings)
+		if !ok {
+			return nil, fmt.Errorf("value %s is not a string, number, bool or list", string(raw))
+		}
+		return []string{text}, nil
 	}
-	return nil
+}
+
+func scalarText(v any, onlyStrings bool) (string, bool) {
+	switch x := v.(type) {
+	case string:
+		return x, true
+	}
+	if onlyStrings {
+		return "", false
+	}
+	switch x := v.(type) {
+	case json.Number:
+		return x.String(), true
+	case bool:
+		return fmt.Sprint(x), true
+	}
+	return "", false
 }
 
 func principals(raw json.RawMessage) ([]Principal, error) {
@@ -283,8 +417,22 @@ func principals(raw json.RawMessage) ([]Principal, error) {
 			}
 		}
 		return out, nil
+	case []any:
+		items, err := principalItems(v)
+		if err != nil {
+			return nil, err
+		}
+		var out []Principal
+		for _, item := range items {
+			if item == "*" {
+				out = append(out, Principal{Kind: "Any", Value: "*"})
+			} else {
+				out = append(out, Principal{Kind: "AWS", Value: item})
+			}
+		}
+		return out, nil
 	}
-	return nil, fmt.Errorf("principal must be a string or an object, got %s", string(raw))
+	return nil, fmt.Errorf("principal must be a string, a list or an object, got %s", string(raw))
 }
 
 func principalItems(value any) ([]string, error) {
@@ -321,20 +469,52 @@ func decodeValue(raw json.RawMessage) (any, error) {
 	return v, nil
 }
 
-func conditions(raw json.RawMessage) map[string]map[string][]string {
-	if len(raw) == 0 {
-		return nil
+// orderedObject returns the members of a JSON object in file order.
+func orderedObject(raw json.RawMessage) ([]string, []json.RawMessage, error) {
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	if tok, err := dec.Token(); err != nil {
+		return nil, nil, err
+	} else if d, ok := tok.(json.Delim); !ok || d != '{' {
+		return nil, nil, fmt.Errorf("expected an object, got %s", string(raw))
 	}
-	var ops map[string]map[string]json.RawMessage
-	if err := json.Unmarshal(raw, &ops); err != nil {
-		return nil
+	var keys []string
+	var values []json.RawMessage
+	for dec.More() {
+		tok, err := dec.Token()
+		if err != nil {
+			return nil, nil, err
+		}
+		var value json.RawMessage
+		if err := dec.Decode(&value); err != nil {
+			return nil, nil, err
+		}
+		keys = append(keys, tok.(string))
+		values = append(values, value)
 	}
-	out := map[string]map[string][]string{}
-	for op, keys := range ops {
-		out[op] = map[string][]string{}
-		for key, value := range keys {
-			out[op][key] = stringList(value)
+	return keys, values, nil
+}
+
+func conditions(raw json.RawMessage) ([]Condition, error) {
+	if len(raw) == 0 || string(raw) == "null" {
+		return nil, nil
+	}
+	ops, opBodies, err := orderedObject(raw)
+	if err != nil {
+		return nil, err
+	}
+	var out []Condition
+	for i, op := range ops {
+		keys, bodies, err := orderedObject(opBodies[i])
+		if err != nil {
+			return nil, fmt.Errorf("%s: %w", op, err)
+		}
+		for j, key := range keys {
+			values, err := stringList(bodies[j], false)
+			if err != nil {
+				return nil, fmt.Errorf("%s %s: %w", op, key, err)
+			}
+			out = append(out, Condition{Operator: op, Key: key, Values: values})
 		}
 	}
-	return out
+	return out, nil
 }

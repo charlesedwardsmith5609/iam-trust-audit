@@ -210,3 +210,206 @@ func TestAccountIDForms(t *testing.T) {
 		}
 	}
 }
+
+func fixtureIDs(t *testing.T, file string) []string {
+	t.Helper()
+	policies, err := parse.ReadFile(filepath.Join("testdata", file))
+	if err != nil {
+		t.Fatalf("%s: %v", file, err)
+	}
+	return ids(Evaluate(policies))
+}
+
+func TestStep2Fixtures(t *testing.T) {
+	cases := []struct {
+		file string
+		want []string
+	}{
+		{"sub-string-not-equals.json", []string{"IAM-OIDC-SUB-MISSING"}},
+		{"externalid-for-all-values.json", []string{"IAM-EXTERNAL-ID-MISSING", "IAM-VENDOR-NETWORK-MISSING"}},
+		{"externalid-null.json", []string{"IAM-EXTERNAL-ID-MISSING", "IAM-VENDOR-NETWORK-MISSING"}},
+		{"externalid-lowercase-key.json", nil},
+		{"sourceip-open.json", []string{"IAM-VENDOR-NETWORK-MISSING"}},
+		{"sourceip-open-v6.json", []string{"IAM-VENDOR-NETWORK-MISSING"}},
+		{"sourceip-only-pass.json", nil},
+		{"orgid-wildcard.json", []string{"IAM-VENDOR-NETWORK-MISSING"}},
+		{"externalid-wildcard.json", []string{"IAM-EXTERNAL-ID-MISSING"}},
+		{"sub-question-mark.json", []string{"IAM-OIDC-SUB-WILDCARD"}},
+		{"sub-other-provider.json", []string{"IAM-OIDC-SUB-MISSING"}},
+		{"deny-statement.json", nil},
+		{"mixed-statements.json", []string{"IAM-EXTERNAL-ID-MISSING", "IAM-VENDOR-NETWORK-MISSING"}},
+		{"principal-star-list.json", []string{"IAM-PRINCIPAL-WILDCARD"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.file, func(t *testing.T) {
+			got := fixtureIDs(t, tc.file)
+			if strings.Join(got, ",") != strings.Join(sortedCopy(tc.want), ",") {
+				t.Fatalf("want %v, got %v", tc.want, got)
+			}
+		})
+	}
+}
+
+func sortedCopy(in []string) []string {
+	out := append([]string{}, in...)
+	sort.Strings(out)
+	return out
+}
+
+func TestMixedStatementsFlagOnlyTheAllow(t *testing.T) {
+	policies, err := parse.ReadFile(filepath.Join("testdata", "mixed-statements.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, f := range Evaluate(policies) {
+		if f.Statement != 1 {
+			t.Fatalf("finding on the Deny statement: %#v", f)
+		}
+	}
+}
+
+func TestEmptyStatementFixtureIsAParseError(t *testing.T) {
+	if _, err := parse.ReadFile(filepath.Join("testdata", "empty-statement.json")); err == nil {
+		t.Fatal("empty Statement was accepted")
+	}
+}
+
+func TestConditionOperators(t *testing.T) {
+	acct := `"Action":"sts:AssumeRole","Principal":{"AWS":"arn:aws:iam::111122223333:root"}`
+	net := `"IpAddress":{"aws:SourceIp":"203.0.113.0/24"}`
+	cases := []struct {
+		name      string
+		condition string
+		wantExtID bool
+	}{
+		{"StringEquals", `"StringEquals":{"sts:ExternalId":"x1"},` + net, false},
+		{"StringLike", `"StringLike":{"sts:ExternalId":"x1"},` + net, false},
+		{"ForAnyValue:StringEquals", `"ForAnyValue:StringEquals":{"sts:ExternalId":"x1"},` + net, false},
+		{"lowercase operator", `"stringequals":{"sts:ExternalId":"x1"},` + net, false},
+		{"upper-case key", `"StringEquals":{"STS:EXTERNALID":"x1"},` + net, false},
+		{"StringNotEquals", `"StringNotEquals":{"sts:ExternalId":"x1"},` + net, true},
+		{"ForAllValues", `"ForAllValues:StringEquals":{"sts:ExternalId":"x1"},` + net, true},
+		{"IfExists", `"StringEqualsIfExists":{"sts:ExternalId":"x1"},` + net, true},
+		{"Null", `"Null":{"sts:ExternalId":"false"},` + net, true},
+		{"question mark value", `"StringLike":{"sts:ExternalId":"x?"},` + net, true},
+		{"empty value", `"StringEquals":{"sts:ExternalId":""},` + net, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := evalDoc(t, `{"Statement":{"Effect":"Allow",`+acct+`,"Condition":{`+tc.condition+`}}}`)
+			has := false
+			for _, f := range got {
+				if f.ID == "IAM-EXTERNAL-ID-MISSING" {
+					has = true
+				}
+			}
+			if has != tc.wantExtID {
+				t.Fatalf("want ext-id finding %v, got %#v", tc.wantExtID, got)
+			}
+		})
+	}
+}
+
+func TestSubOperatorAndProvider(t *testing.T) {
+	fed := `"Action":"sts:AssumeRoleWithWebIdentity","Principal":{"Federated":"arn:aws:iam::123456789012:oidc-provider/token.actions.githubusercontent.com"}`
+	main := `"repo:example-org/example-repo:ref:refs/heads/main"`
+	cases := []struct {
+		name string
+		cond string
+		want []string
+	}{
+		{"StringEquals ok", `"StringEquals":{"token.actions.githubusercontent.com:sub":` + main + `}`, nil},
+		{"StringLike ok", `"StringLike":{"token.actions.githubusercontent.com:sub":` + main + `}`, nil},
+		{"ForAnyValue ok", `"ForAnyValue:StringEquals":{"token.actions.githubusercontent.com:sub":` + main + `}`, nil},
+		{"key case", `"StringEquals":{"Token.Actions.GitHubUserContent.com:SUB":` + main + `}`, nil},
+		{"ForAllValues", `"ForAllValues:StringEquals":{"token.actions.githubusercontent.com:sub":` + main + `}`, []string{"IAM-OIDC-SUB-MISSING"}},
+		{"Null", `"Null":{"token.actions.githubusercontent.com:sub":"false"}`, []string{"IAM-OIDC-SUB-MISSING"}},
+		{"question", `"StringLike":{"token.actions.githubusercontent.com:sub":"repo:o/r:ref:refs/heads/ma?n"}`, []string{"IAM-OIDC-SUB-WILDCARD"}},
+		{"star", `"StringLike":{"token.actions.githubusercontent.com:sub":"repo:o/*"}`, []string{"IAM-OIDC-SUB-WILDCARD"}},
+		{"other provider", `"StringEquals":{"evil.example.com:sub":` + main + `}`, []string{"IAM-OIDC-SUB-MISSING"}},
+		{"aud only", `"StringEquals":{"token.actions.githubusercontent.com:aud":"sts.amazonaws.com"}`, []string{"IAM-OIDC-SUB-MISSING"}},
+		{"missing aud is fine", `"StringEquals":{"token.actions.githubusercontent.com:sub":` + main + `}`, nil},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := ids(evalDoc(t, `{"Statement":{"Effect":"Allow",`+fed+`,"Condition":{`+tc.cond+`}}}`))
+			if strings.Join(got, ",") != strings.Join(sortedCopy(tc.want), ",") {
+				t.Fatalf("want %v, got %v", tc.want, got)
+			}
+		})
+	}
+}
+
+func TestNetworkConditions(t *testing.T) {
+	base := `{"Statement":{"Effect":"Allow","Action":"sts:AssumeRole","Principal":{"AWS":"arn:aws:iam::111122223333:root"},"Condition":{"ForAnyValue:StringEquals":{"sts:ExternalId":"x1"},`
+	cases := []struct {
+		name string
+		cond string
+		want bool // network finding expected
+	}{
+		{"real cidr", `"IpAddress":{"aws:SourceIp":"203.0.113.0/24"}}}}`, false},
+		{"v6 cidr", `"IpAddress":{"aws:SourceIp":"2001:db8::/32"}}}}`, false},
+		{"open v4", `"IpAddress":{"aws:SourceIp":"0.0.0.0/0"}}}}`, true},
+		{"open v6", `"IpAddress":{"aws:SourceIp":"::/0"}}}}`, true},
+		{"open among others", `"IpAddress":{"aws:SourceIp":["203.0.113.0/24","0.0.0.0/0"]}}}}`, true},
+		{"NotIpAddress", `"NotIpAddress":{"aws:SourceIp":"203.0.113.0/24"}}}}`, true},
+		{"orgid", `"StringEquals":{"aws:PrincipalOrgID":"o-abc1234567"}}}}`, false},
+		{"orgid star", `"StringLike":{"aws:PrincipalOrgID":"*"}}}}`, true},
+		{"none", `"StringEquals":{"aws:username":"x"}}}}`, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := evalDoc(t, base+tc.cond)
+			has := false
+			for _, f := range got {
+				if f.ID == "IAM-VENDOR-NETWORK-MISSING" {
+					has = true
+				}
+			}
+			if has != tc.want {
+				t.Fatalf("want network finding %v, got %#v", tc.want, got)
+			}
+		})
+	}
+}
+
+// Every rule id needs one fixture that fails it and one that passes it.
+func TestEveryRuleHasPassAndFailFixtures(t *testing.T) {
+	fail := map[string]string{
+		"IAM-PRINCIPAL-WILDCARD":     "wildcard-principal.json",
+		"IAM-EXTERNAL-ID-MISSING":    "missing-external-id.json",
+		"IAM-VENDOR-NETWORK-MISSING": "missing-vendor-network.json",
+		"IAM-OIDC-SUB-MISSING":       "oidc-sub-missing.json",
+		"IAM-OIDC-SUB-WILDCARD":      "oidc-sub-wildcard.json",
+		"IAM-UNPARSED":               "tf-jsonencode.tf",
+	}
+	pass := map[string]string{
+		"IAM-PRINCIPAL-WILDCARD":     "pass.json",
+		"IAM-EXTERNAL-ID-MISSING":    "sourceip-only-pass.json",
+		"IAM-VENDOR-NETWORK-MISSING": "sourceip-only-pass.json",
+		"IAM-OIDC-SUB-MISSING":       "pass.json",
+		"IAM-OIDC-SUB-WILDCARD":      "pass.json",
+		"IAM-UNPARSED":               "pass.json",
+	}
+	for _, id := range AllIDs {
+		f, p := fail[id], pass[id]
+		if f == "" || p == "" {
+			t.Fatalf("rule %s lacks a pass or fail fixture", id)
+		}
+		if !contains(fixtureIDs(t, f), id) {
+			t.Errorf("%s: fixture %s does not trigger it", id, f)
+		}
+		if contains(fixtureIDs(t, p), id) {
+			t.Errorf("%s: pass fixture %s triggers it", id, p)
+		}
+	}
+}
+
+func contains(list []string, s string) bool {
+	for _, v := range list {
+		if v == s {
+			return true
+		}
+	}
+	return false
+}

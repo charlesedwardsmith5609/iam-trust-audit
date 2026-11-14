@@ -1,0 +1,8 @@
+{
+  "Statement": {
+    "Effect": "Allow",
+    "Action": "sts:AssumeRole",
+    "Principal": {"AWS": "arn:aws:iam::111122223333:root"},
+    "Condition": {"StringLike": {"sts:ExternalId": "*"}, "StringEquals": {"aws:PrincipalOrgID": "o-abc1234567"}}
+  }
+}

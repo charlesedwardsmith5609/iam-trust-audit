@@ -3,6 +3,7 @@ package rules
 
 import (
 	"fmt"
+	"net/netip"
 	"strings"
 
 	"iam-trust-audit/internal/parse"
@@ -15,6 +16,16 @@ type Finding struct {
 	File      string `json:"file"`
 	Statement int    `json:"statement"`
 	Fix       string `json:"fix"`
+}
+
+// AllIDs lists every rule id Evaluate can emit.
+var AllIDs = []string{
+	"IAM-PRINCIPAL-WILDCARD",
+	"IAM-EXTERNAL-ID-MISSING",
+	"IAM-VENDOR-NETWORK-MISSING",
+	"IAM-OIDC-SUB-MISSING",
+	"IAM-OIDC-SUB-WILDCARD",
+	"IAM-UNPARSED",
 }
 
 // Evaluate applies every rule to policies.
@@ -61,7 +72,7 @@ func fileName(policy parse.Policy) string {
 func principals(file string, statement parse.Statement) []Finding {
 	wildcard := len(statement.NotPrincipals) > 0
 	for _, principal := range statement.Principals {
-		if principal.Kind == "Any" || strings.Contains(principal.Value, "*") {
+		if principal.Kind == "Any" || isWildcard(principal.Value) {
 			wildcard = true
 		}
 	}
@@ -139,7 +150,7 @@ func oidc(statement parse.Statement) bool {
 }
 
 func subCondition(file string, statement parse.Statement) []Finding {
-	values := conditionValues(statement, "sub")
+	values := subValues(statement)
 	if len(values) == 0 {
 		return []Finding{{
 			ID:        "IAM-OIDC-SUB-MISSING",
@@ -150,7 +161,7 @@ func subCondition(file string, statement parse.Statement) []Finding {
 		}}
 	}
 	for _, value := range values {
-		if value == "" || strings.Contains(value, "*") {
+		if value == "" || isWildcard(value) {
 			return []Finding{{
 				ID:        "IAM-OIDC-SUB-WILDCARD",
 				Severity:  "high",
@@ -161,6 +172,38 @@ func subCondition(file string, statement parse.Statement) []Finding {
 		}
 	}
 	return nil
+}
+
+// subValues returns the values of positive-operator sub conditions. When the
+// statement names exactly one Federated provider, the key must be that provider's
+// "<host>:sub"; otherwise any "<provider>:sub" key counts.
+func subValues(statement parse.Statement) []string {
+	provider := ""
+	count := 0
+	for _, principal := range statement.Principals {
+		if principal.Kind == "Federated" {
+			count++
+			provider = principal.Value
+			if at := strings.Index(provider, "oidc-provider/"); at >= 0 {
+				provider = provider[at+len("oidc-provider/"):]
+			}
+		}
+	}
+	var out []string
+	for _, c := range statement.Conditions {
+		if !positiveOperator(c.Operator) {
+			continue
+		}
+		if count == 1 {
+			if !strings.EqualFold(c.Key, provider+":sub") {
+				continue
+			}
+		} else if !strings.HasSuffix(strings.ToLower(c.Key), ":sub") && !strings.EqualFold(c.Key, "sub") {
+			continue
+		}
+		out = append(out, c.Values...)
+	}
+	return out
 }
 
 func crossAccount(statement parse.Statement) bool {
@@ -188,7 +231,7 @@ func accountID(value string) bool {
 }
 
 func externalID(file string, statement parse.Statement) []Finding {
-	if len(conditionValues(statement, "sts:ExternalId")) > 0 {
+	if keyUsable(statement, "sts:ExternalId", func(v string) bool { return v != "" && !isWildcard(v) }) {
 		return nil
 	}
 	return []Finding{{
@@ -196,12 +239,14 @@ func externalID(file string, statement parse.Statement) []Finding {
 		Severity:  "high",
 		File:      file,
 		Statement: statement.Index,
-		Fix:       "Require sts:ExternalId on this cross-account trust.",
+		Fix:       "Require sts:ExternalId with a specific value (no wildcards) on this cross-account trust.",
 	}}
 }
 
 func vendorNetwork(file string, statement parse.Statement) []Finding {
-	if len(conditionValues(statement, "aws:SourceIp")) > 0 || len(conditionValues(statement, "aws:PrincipalOrgID")) > 0 {
+	ip := keyUsable(statement, "aws:SourceIp", func(v string) bool { return v != "" && !isWildcard(v) && !anyCIDR(v) })
+	org := keyUsable(statement, "aws:PrincipalOrgID", func(v string) bool { return v != "" && !isWildcard(v) })
+	if ip || org {
 		return nil
 	}
 	return []Finding{{
@@ -209,18 +254,55 @@ func vendorNetwork(file string, statement parse.Statement) []Finding {
 		Severity:  "medium",
 		File:      file,
 		Statement: statement.Index,
-		Fix:       "Require aws:SourceIp or aws:PrincipalOrgID on this cross-account trust.",
+		Fix:       "Require a specific aws:SourceIp range (not 0.0.0.0/0 or ::/0) or aws:PrincipalOrgID (no wildcards) on this cross-account trust.",
 	}}
 }
 
-func conditionValues(statement parse.Statement, suffix string) []string {
-	var out []string
-	for _, keys := range statement.Conditions {
-		for key, values := range keys {
-			if key == suffix || strings.HasSuffix(key, ":"+suffix) {
-				out = append(out, values...)
+// keyUsable is true when a positive-operator condition on key has at least one
+// value and every value passes ok. Keys match case-insensitively; a provider
+// prefix before the key name is allowed.
+func keyUsable(statement parse.Statement, key string, ok func(string) bool) bool {
+	found := false
+	for _, c := range statement.Conditions {
+		if !positiveOperator(c.Operator) || !keyMatches(c.Key, key) {
+			continue
+		}
+		if len(c.Values) == 0 {
+			return false
+		}
+		for _, v := range c.Values {
+			if !ok(v) {
+				return false
 			}
 		}
+		found = true
 	}
-	return out
+	return found
+}
+
+func keyMatches(have, want string) bool {
+	have, want = strings.ToLower(have), strings.ToLower(want)
+	return have == want || strings.HasSuffix(have, ":"+want)
+}
+
+// positiveOperator accepts operators that require a match: string and IP
+// equality forms, optionally under ForAnyValue:. Negations, ForAllValues:,
+// IfExists and Null are rejected.
+func positiveOperator(op string) bool {
+	op = strings.ToLower(op)
+	op = strings.TrimPrefix(op, "foranyvalue:")
+	switch op {
+	case "stringequals", "stringlike", "ipaddress":
+		return true
+	}
+	return false
+}
+
+func isWildcard(s string) bool {
+	return strings.ContainsAny(s, "*?")
+}
+
+func anyCIDR(s string) bool {
+	prefix, err := netip.ParsePrefix(strings.TrimSpace(s))
+	return err == nil && prefix.Bits() == 0
 }

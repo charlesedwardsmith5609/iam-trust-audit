@@ -1,12 +1,15 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
+	"time"
 )
 
 func TestCLI(t *testing.T) {
@@ -91,6 +94,51 @@ func TestExitCodesStep1(t *testing.T) {
 			}
 			if !strings.Contains(string(out), tc.wantOut) {
 				t.Fatalf("output lacks %q:\n%s", tc.wantOut, out)
+			}
+		})
+	}
+}
+
+func TestExitCodesStep2(t *testing.T) {
+	bin := buildBin(t)
+	dir := t.TempDir()
+	fifo := filepath.Join(dir, "pipe.json")
+	if err := syscall.Mkfifo(fifo, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	big := filepath.Join(dir, "big.json")
+	if err := os.WriteFile(big, []byte(strings.Repeat(" ", (1<<20)+1)), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	bad := filepath.Join(dir, "bad.json")
+	if err := os.WriteFile(bad, []byte(`{"Statement"`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cases := []struct {
+		name string
+		file string
+		want int
+	}{
+		{"empty statement", fixture("empty-statement.json"), 2},
+		{"invalid json", bad, 2},
+		{"fifo", fifo, 2},
+		{"oversized", big, 2},
+		{"dev zero", "/dev/zero", 2},
+		{"missing file", filepath.Join(dir, "nope.json"), 2},
+		{"finding", fixture("sub-question-mark.json"), 1},
+		{"deny only", fixture("deny-statement.json"), 0},
+		{"sourceip only pass", fixture("sourceip-only-pass.json"), 0},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			out, err := exec.CommandContext(ctx, bin, tc.file).CombinedOutput()
+			if ctx.Err() != nil {
+				t.Fatalf("timed out\n%s", out)
+			}
+			if got := exitCode(err); got != tc.want {
+				t.Fatalf("exit %d, want %d\n%s", got, tc.want, out)
 			}
 		})
 	}

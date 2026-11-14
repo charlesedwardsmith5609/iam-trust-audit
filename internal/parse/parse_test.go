@@ -4,7 +4,9 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
+	"time"
 )
 
 func TestJSONAndHeredoc(t *testing.T) {
@@ -175,5 +177,128 @@ func TestNotPrincipalAndNotAction(t *testing.T) {
 	s := p.Statements[0]
 	if len(s.NotActions) != 2 || len(s.NotPrincipals) != 1 || s.NotPrincipals[0].Value != "arn:aws:iam::111122223333:root" {
 		t.Fatalf("statement: %#v", s)
+	}
+}
+
+func readErr(t *testing.T, path string) error {
+	t.Helper()
+	done := make(chan error, 1)
+	go func() {
+		_, err := ReadFile(path)
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		return err
+	case <-time.After(5 * time.Second):
+		t.Fatalf("ReadFile(%s) did not return within 5s", path)
+		return nil
+	}
+}
+
+func TestSpecialFilesAreRejectedWithoutHanging(t *testing.T) {
+	if err := readErr(t, "/dev/zero"); err == nil {
+		t.Fatal("/dev/zero was accepted")
+	}
+	fifo := filepath.Join(t.TempDir(), "pipe.json")
+	if err := syscall.Mkfifo(fifo, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := readErr(t, fifo); err == nil {
+		t.Fatal("FIFO was accepted")
+	}
+}
+
+func TestSizeBound(t *testing.T) {
+	doc := `{"Statement":{"Effect":"Allow","Action":"sts:AssumeRole","Principal":{"AWS":"arn:aws:iam::111122223333:root"}}}`
+	exact := doc + strings.Repeat(" ", MaxBytes-len(doc))
+	if _, err := ReadFile(writeTemp(t, "exact.json", exact)); err != nil {
+		t.Fatalf("exactly MaxBytes was rejected: %v", err)
+	}
+	if err := readErr(t, writeTemp(t, "big.json", exact+" ")); err == nil {
+		t.Fatal("MaxBytes+1 was accepted")
+	}
+}
+
+func TestSymlinkLastComponentIsRejected(t *testing.T) {
+	dir := t.TempDir()
+	target := writeTemp(t, "real.json", wildcardDoc)
+	link := filepath.Join(dir, "link.json")
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatal(err)
+	}
+	if err := readErr(t, link); err == nil {
+		t.Fatal("symlink was accepted")
+	}
+}
+
+func TestEmptyOrMissingStatementIsAnError(t *testing.T) {
+	for _, doc := range []string{`{"Statement":[]}`, `{"Statement":null}`, `{"Statement":{}}`, `{}`, `{"Version":"2012-10-17"}`} {
+		if _, err := ParseJSON("x.json", []byte(doc)); err == nil {
+			t.Fatalf("%s was accepted", doc)
+		}
+	}
+}
+
+func TestPrincipalStarList(t *testing.T) {
+	p, err := ParseJSON("x.json", []byte(`{"Statement":{"Effect":"Allow","Action":"sts:AssumeRole","Principal":["*"]}}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := p.Statements[0].Principals
+	if len(got) != 1 || got[0].Kind != "Any" {
+		t.Fatalf("principals: %#v", got)
+	}
+}
+
+func TestUndecodableActionAndConditionAreErrors(t *testing.T) {
+	cases := []string{
+		`"Action":5,"Principal":"*"`,
+		`"Action":["sts:AssumeRole",5],"Principal":"*"`,
+		`"Action":"sts:AssumeRole","Principal":"*","Condition":"oops"`,
+		`"Action":"sts:AssumeRole","Principal":"*","Condition":{"StringEquals":"oops"}`,
+		`"Action":"sts:AssumeRole","Principal":"*","Condition":{"StringEquals":{"k":{"a":1}}}`,
+	}
+	for _, c := range cases {
+		if _, err := ParseJSON("x.json", []byte(`{"Statement":{"Effect":"Allow",`+c+`}}`)); err == nil {
+			t.Fatalf("%s was accepted", c)
+		}
+	}
+}
+
+func TestDuplicateKeysAndDeepNestingAreErrors(t *testing.T) {
+	dup := `{"Statement":{"Effect":"Allow","Action":"sts:AssumeRole","Principal":"*"},"Statement":{"Effect":"Deny"}}`
+	if _, err := ParseJSON("x.json", []byte(dup)); err == nil {
+		t.Fatal("duplicate Statement key was accepted")
+	}
+	dupInner := `{"Statement":{"Effect":"Allow","Effect":"Deny","Action":"sts:AssumeRole","Principal":"*"}}`
+	if _, err := ParseJSON("x.json", []byte(dupInner)); err == nil {
+		t.Fatal("duplicate Effect key was accepted")
+	}
+	deep := `{"Statement":{"Effect":"Allow","Action":"sts:AssumeRole","Principal":"*"},"x":` + strings.Repeat("[", 100) + strings.Repeat("]", 100) + `}`
+	if _, err := ParseJSON("x.json", []byte(deep)); err == nil {
+		t.Fatal("100-deep nesting was accepted")
+	}
+}
+
+func TestConditionsKeepFileOrderAndOperator(t *testing.T) {
+	doc := `{"Statement":{"Effect":"Allow","Action":"sts:AssumeRole","Principal":"*","Condition":{"StringLike":{"b:k":["v1","v2"],"a:k":true},"ForAnyValue:StringEquals":{"c:k":5}}}}`
+	p, err := ParseJSON("x.json", []byte(doc))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := p.Statements[0].Conditions
+	want := []Condition{
+		{"StringLike", "b:k", []string{"v1", "v2"}},
+		{"StringLike", "a:k", []string{"true"}},
+		{"ForAnyValue:StringEquals", "c:k", []string{"5"}},
+	}
+	if len(got) != len(want) {
+		t.Fatalf("got %#v", got)
+	}
+	for i := range want {
+		if got[i].Operator != want[i].Operator || got[i].Key != want[i].Key || strings.Join(got[i].Values, ",") != strings.Join(want[i].Values, ",") {
+			t.Fatalf("condition %d: got %#v want %#v", i, got[i], want[i])
+		}
 	}
 }

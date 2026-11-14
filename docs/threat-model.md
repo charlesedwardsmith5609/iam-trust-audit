@@ -9,7 +9,9 @@ A trust policy can let the wrong principal assume a role. The rules in REQUIREME
 ## What it is not
 
 - It does not prove a live role is safe. A file that is not the policy AWS stored will look fine.
-- It does not parse `jsonencode` HCL. A policy written only that way is invisible to this tool. needs verification: a full HCL parser would be a new dependency, which this project does not take.
+- It does not parse `jsonencode` HCL. A `.tf` `assume_role_policy` that is not a JSON heredoc (`jsonencode`, a data source, a quoted string, or a heredoc with no terminator) is reported as a high `IAM-UNPARSED` finding, not skipped. A full HCL parser would be a new dependency, which this project does not take.
+- It does not check the OIDC `aud` claim. A missing `aud` condition is not a finding.
+- The OIDC `sub` check requires a positive operator (`StringEquals`, `StringLike`, `ForAnyValue:` forms). When the statement names one Federated provider, the `sub` key must belong to that provider; otherwise any `<provider>:sub` key counts. `*` and `?` in a `sub` value are reported as a wildcard.
 - It cannot tell a same-account principal from a cross-account principal. Every AWS account ARN on `sts:AssumeRole` is reported as cross-account.
 
 ## Assets
@@ -18,4 +20,4 @@ The files can contain account ids and external ids. The report names the file, t
 
 ## Failure
 
-An unreadable file, a symlink, a file over 1 MiB, or a JSON syntax error exits 2. The tool does not skip a broken file and then exit 0.
+An unreadable file, a non-regular file (a FIFO or device), a symlink as the last path component, a file over 1 MiB, a JSON syntax error, a duplicate JSON key, nesting deeper than 64 levels, an empty or null `Statement`, or an undecodable `Principal`, `Action` or `Condition` exits 2. A symlinked parent directory is still followed. The tool does not skip a broken file and then exit 0.
