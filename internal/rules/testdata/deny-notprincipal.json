@@ -1,0 +1,7 @@
+{
+  "Statement": {
+    "Effect": "Deny",
+    "Action": "sts:AssumeRole",
+    "NotPrincipal": {"AWS": "arn:aws:iam::111122223333:root"}
+  }
+}
