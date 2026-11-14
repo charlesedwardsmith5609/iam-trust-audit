@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"testing"
@@ -141,5 +142,147 @@ func TestExitCodesStep2(t *testing.T) {
 				t.Fatalf("exit %d, want %d\n%s", got, tc.want, out)
 			}
 		})
+	}
+}
+
+func TestFailOnIsNormalizedThenValidated(t *testing.T) {
+	bin := buildBin(t)
+	medium := fixture("missing-vendor-network.json") // one medium finding
+	cases := []struct {
+		level string
+		want  int
+	}{
+		{"low", 1}, {"Medium", 1}, {"MEDIUM", 1}, {" medium ", 1},
+		{"high", 0}, {"HIGH", 0}, {" high", 0}, {"High", 0},
+		{"urgent", 2}, {"", 2}, {"   ", 2},
+	}
+	for _, tc := range cases {
+		t.Run(strconv.Quote(tc.level), func(t *testing.T) {
+			out, err := exec.Command(bin, "--fail-on", tc.level, medium).CombinedOutput()
+			if got := exitCode(err); got != tc.want {
+				t.Fatalf("exit %d, want %d\n%s", got, tc.want, out)
+			}
+		})
+	}
+	out, err := exec.Command(bin, "--format", "json", "--fail-on", "HIGH", medium).CombinedOutput()
+	if exitCode(err) != 0 || !strings.Contains(string(out), `"fail_on": "high"`) {
+		t.Fatalf("json should carry the normalized level: %v\n%s", err, out)
+	}
+}
+
+func parseFixture(name string) string {
+	return filepath.Join("..", "..", "internal", "parse", "testdata", name)
+}
+
+func TestGetRoleAndEncodedDocumentsMatchBarePolicy(t *testing.T) {
+	bin := buildBin(t)
+	for _, name := range []string{"policy.json", "get-role.json", "get-role-string.json", "get-role-encoded.json", "url-encoded.json"} {
+		t.Run(name, func(t *testing.T) {
+			out, err := exec.Command(bin, parseFixture(name)).CombinedOutput()
+			if got := exitCode(err); got != 1 {
+				t.Fatalf("exit %d, want 1\n%s", got, out)
+			}
+			if !strings.Contains(string(out), "IAM-OIDC-SUB-WILDCARD") || strings.Count(string(out), "IAM-") != 1 {
+				t.Fatalf("want exactly the sub wildcard finding:\n%s", out)
+			}
+		})
+	}
+}
+
+func TestErrorNamesThePathOnce(t *testing.T) {
+	bin := buildBin(t)
+	dir := t.TempDir()
+	broken := filepath.Join(dir, "broken.json")
+	if err := os.WriteFile(broken, []byte(`{"Statement"`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	empty := filepath.Join(dir, "empty.json")
+	if err := os.WriteFile(empty, []byte(`{"Statement":[]}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range []string{parseFixture("url-encoded-bad.json"), broken, empty, filepath.Join(dir, "missing.json")} {
+		t.Run(filepath.Base(path), func(t *testing.T) {
+			cmd := exec.Command(bin, path)
+			var stderr strings.Builder
+			cmd.Stderr = &stderr
+			err := cmd.Run()
+			if got := exitCode(err); got != 2 {
+				t.Fatalf("exit %d, want 2\n%s", got, stderr.String())
+			}
+			if n := strings.Count(stderr.String(), path); n != 1 {
+				t.Fatalf("path appears %d times, want 1:\n%s", n, stderr.String())
+			}
+		})
+	}
+}
+
+func TestFileNameIsQuotedInTextOutput(t *testing.T) {
+	bin := buildBin(t)
+	name := filepath.Join(t.TempDir(), "evil\n\x1b[31mred.json")
+	doc, err := os.ReadFile(fixture("wildcard-principal.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(name, doc, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	out, _ := exec.Command(bin, name).CombinedOutput()
+	if strings.Contains(string(out), "\x1b") || !strings.Contains(string(out), "IAM-PRINCIPAL-WILDCARD") {
+		t.Fatalf("output: %q", out)
+	}
+}
+
+func TestCIChecksOutWithoutPersistedCredentials(t *testing.T) {
+	data, err := os.ReadFile(filepath.Join("..", "..", ".github", "workflows", "ci.yml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	lines := strings.Split(string(data), "\n")
+	for i, line := range lines {
+		if !strings.Contains(line, "actions/checkout@") {
+			continue
+		}
+		step := ""
+		for _, next := range lines[i+1:] {
+			if strings.HasPrefix(strings.TrimSpace(next), "- ") {
+				break
+			}
+			step += next + "\n"
+		}
+		if !strings.Contains(step, "persist-credentials: false") {
+			t.Fatalf("checkout step lacks persist-credentials: false:\n%s", line+"\n"+step)
+		}
+		return
+	}
+	t.Fatal("no checkout step found")
+}
+
+func TestGoDirectiveFollowsD10(t *testing.T) {
+	data, err := os.ReadFile(filepath.Join("..", "..", "go.mod"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var goLine, toolchain string
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "go ") {
+			goLine = strings.TrimPrefix(line, "go ")
+		}
+		if strings.HasPrefix(line, "toolchain ") {
+			toolchain = strings.TrimPrefix(line, "toolchain ")
+		}
+	}
+	if !(goLine == "1.26.11" && toolchain == "") && !(goLine == "1.26" && toolchain == "go1.26.11") {
+		t.Fatalf("go.mod: go %q toolchain %q", goLine, toolchain)
+	}
+}
+
+func TestDecisionsHasA20261114Entry(t *testing.T) {
+	data, err := os.ReadFile(filepath.Join("..", "..", "DECISIONS.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), "2026-11-14") {
+		t.Fatal("DECISIONS.md has no 2026-11-14 entry")
 	}
 }

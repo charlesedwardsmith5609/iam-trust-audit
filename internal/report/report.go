@@ -42,7 +42,7 @@ func Text(w io.Writer, findings []rules.Finding) error {
 		return err
 	}
 	for _, finding := range findings {
-		if _, err := fmt.Fprintf(w, "%s %s %s statement %d\n  fix: %s\n", finding.Severity, finding.ID, finding.File, finding.Statement, finding.Fix); err != nil {
+		if _, err := fmt.Fprintf(w, "%s %s %q statement %d\n  fix: %s\n", finding.Severity, finding.ID, finding.File, finding.Statement, finding.Fix); err != nil {
 			return err
 		}
 	}

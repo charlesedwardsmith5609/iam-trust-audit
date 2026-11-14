@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net/url"
 	"os"
 	"sort"
 	"strings"
@@ -131,7 +132,21 @@ type Unparsed struct {
 	Reason string
 }
 
+// decodeEncoded percent-decodes a document that starts with an encoded "{".
+// url.PathUnescape is used so that "+" stays a plus sign.
+func decodeEncoded(data []byte) ([]byte, error) {
+	if len(data) >= 3 && strings.EqualFold(string(data[:3]), "%7B") {
+		text, err := url.PathUnescape(string(data))
+		if err != nil {
+			return nil, fmt.Errorf("invalid percent-encoding: %w", err)
+		}
+		return []byte(text), nil
+	}
+	return data, nil
+}
+
 type rawDoc struct {
+	Role                     json.RawMessage `json:"Role"`
 	Statement                json.RawMessage `json:"Statement"`
 	AssumeRolePolicyDocument json.RawMessage `json:"AssumeRolePolicyDocument"`
 }
@@ -175,15 +190,28 @@ func ReadFile(path string) ([]Policy, error) {
 	return []Policy{policy}, nil
 }
 
-// ParseJSON parses a trust policy or a role wrapper with AssumeRolePolicyDocument.
+// ParseJSON parses a trust policy, an `aws iam get-role` document ({"Role":
+// {"AssumeRolePolicyDocument": ...}}), a role wrapper with AssumeRolePolicyDocument,
+// or a percent-encoded policy. The document may be an object or a JSON string.
+// Errors do not name the file; ReadFile adds the path once.
 func ParseJSON(file string, data []byte) (Policy, error) {
-	data = bytes.TrimSpace(data)
+	data, err := decodeEncoded(bytes.TrimSpace(data))
+	if err != nil {
+		return Policy{}, err
+	}
 	if err := checkJSON(data); err != nil {
 		return Policy{}, fmt.Errorf("invalid JSON: %w", err)
 	}
 	var probe rawDoc
 	if err := json.Unmarshal(data, &probe); err != nil {
 		return Policy{}, fmt.Errorf("invalid JSON: %w", err)
+	}
+	if len(probe.Statement) == 0 && len(probe.Role) > 0 {
+		data = probe.Role
+		probe = rawDoc{}
+		if err := json.Unmarshal(data, &probe); err != nil {
+			return Policy{}, fmt.Errorf("invalid JSON in Role: %w", err)
+		}
 	}
 	body := data
 	if len(probe.Statement) == 0 && len(probe.AssumeRolePolicyDocument) > 0 {
@@ -193,7 +221,10 @@ func ParseJSON(file string, data []byte) (Policy, error) {
 			if err := json.Unmarshal(body, &encoded); err != nil {
 				return Policy{}, err
 			}
-			body = []byte(encoded)
+			body, err = decodeEncoded([]byte(strings.TrimSpace(encoded)))
+			if err != nil {
+				return Policy{}, err
+			}
 		}
 	}
 	var doc struct {
