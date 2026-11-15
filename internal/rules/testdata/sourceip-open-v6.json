@@ -1,0 +1,8 @@
+{
+  "Statement": {
+    "Effect": "Allow",
+    "Action": "sts:AssumeRole",
+    "Principal": {"AWS": "arn:aws:iam::111122223333:root"},
+    "Condition": {"StringEquals": {"sts:ExternalId": "vendor-external-id"}, "IpAddress": {"aws:SourceIp": "::/0"}}
+  }
+}

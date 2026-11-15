@@ -25,3 +25,15 @@ Human text and JSON. Exit non-zero when a finding is at or above `--fail-on` (de
 ## Tests
 
 Fixtures for a passing policy and a failing policy for every rule. Tests do not use the network.
+
+## Review fixes 2026-11-14
+
+Source: `.review/findings.md`, decisions in `.review/DECISIONS.md`. Standard library only.
+
+- Unknown input is loud (D5): a `.tf` file whose `assume_role_policy` cannot be read as a JSON heredoc (for example `jsonencode`, a data source reference, or a heredoc with no terminator) produces a HIGH `IAM-UNPARSED` finding and exit 1. Invalid JSON, unreadable, oversized or non-regular files exit 2. An empty or null `Statement`, and an undecodable `Principal`, `Action` or `Condition`, exit 2.
+- Every `assume_role_policy` in a `.tf` file is audited, including `<<-` heredocs. The `<<` must be on the same line as the `=`.
+- `NotPrincipal` and `NotAction` are parsed. `Allow` with `NotPrincipal` is a wildcard principal. Action matching is case-insensitive and honors `*` and `?`. A bare 12-digit account id, or a numeric one, is a cross-account principal.
+- Condition operators: only positive operators (`StringEquals`, `StringLike`, `ForAnyValue:` variants) satisfy `sub` and `sts:ExternalId`. `StringNotEquals`, `ForAllValues:` and `Null` do not. `aws:SourceIp` of `0.0.0.0/0` or `::/0`, and `*` in `aws:PrincipalOrgID` or ExternalId, are findings. Condition keys match case-insensitively. A `sub` containing `?` is a wildcard. The `sub` check and the missing `aud` check are described in the threat model.
+- Files are read with one open, `Stat`, a regular-file check and a 1 MiB bounded read.
+- Output: file names are printed with `%q`. `--fail-on` is lowercased once and then validated. `aws iam get-role` output and URL-encoded documents are supported or documented. `go.mod` follows D10. CI checkout sets `persist-credentials: false`.
+- Tests: one pass and one fail fixture per rule, and the CLI test asserts exit code 1 versus 2 exactly.

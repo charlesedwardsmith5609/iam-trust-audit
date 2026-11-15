@@ -29,3 +29,7 @@ Finding: a JSON report that echoed the policy could print an external id or a se
 ## 2026-11-13 phase 5 review
 
 Finding: the README could be read as a claim that every Terraform trust policy is scanned. Resolution: the README repeats that jsonencode HCL is not parsed and that the home account is unknown. Checks were re-run on the committed tree. No second model was available.
+
+## 2026-11-14 review fixes and cross-review status
+
+Finding: the 2026-11-13 entries say no second model was available, and they were never edited. That is now out of date for this branch. Resolution: a cross-review did run on 2026-11-14 (`scripts/cross-review.sh`). The Cursor provider failed because the directory was not trusted, and the run fell back to openai (gpt-6.1-sol). That is a single-vendor review, not the intended Cursor one. Its output was saved as `.reviews/review-20261114-015256-openai.md` (the `.reviews/` directory is git-ignored, so it is not in the repository). The earlier entries are kept as written; this entry supersedes their "no second model" lines. The 17 findings from that review are fixed in the commits for plans/step-1.md to plans/step-3.md. `go.mod` stays at `go 1.26.11` (D10) because the local toolchain is go1.26.11 and resolves it. Cross-review was not re-run after the fixes; a re-review is still open.

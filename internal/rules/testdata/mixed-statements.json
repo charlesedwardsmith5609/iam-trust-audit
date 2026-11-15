@@ -1,0 +1,6 @@
+{
+  "Statement": [
+    {"Effect": "Deny", "Action": "sts:AssumeRole", "Principal": "*"},
+    {"Effect": "Allow", "Action": "sts:AssumeRole", "Principal": {"AWS": "arn:aws:iam::111122223333:root"}}
+  ]
+}

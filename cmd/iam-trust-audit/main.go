@@ -4,6 +4,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"strings"
 
 	"iam-trust-audit/internal/parse"
 	"iam-trust-audit/internal/report"
@@ -18,7 +19,10 @@ func main() {
 		fmt.Fprintln(os.Stderr, "usage: iam-trust-audit [--format text|json] [--fail-on low|medium|high] file...")
 		os.Exit(2)
 	}
-	if report.Rank(*failOn) == 3 && *failOn != "high" {
+	level := strings.ToLower(strings.TrimSpace(*failOn))
+	switch level {
+	case "low", "medium", "high":
+	default:
 		fmt.Fprintln(os.Stderr, "fail-on must be low, medium, or high")
 		os.Exit(2)
 	}
@@ -26,7 +30,7 @@ func main() {
 	for _, path := range flag.Args() {
 		parsed, err := parse.ReadFile(path)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "read %s: %v\n", path, err)
+			fmt.Fprintln(os.Stderr, err)
 			os.Exit(2)
 		}
 		policies = append(policies, parsed...)
@@ -34,7 +38,7 @@ func main() {
 	findings := rules.Evaluate(policies)
 	var err error
 	if *format == "json" {
-		err = report.JSON(os.Stdout, findings, *failOn)
+		err = report.JSON(os.Stdout, findings, level)
 	} else if *format == "text" {
 		err = report.Text(os.Stdout, findings)
 	} else {
@@ -45,7 +49,7 @@ func main() {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(2)
 	}
-	if report.Exceeds(findings, *failOn) {
+	if report.Exceeds(findings, level) {
 		os.Exit(1)
 	}
 }

@@ -1,0 +1,7 @@
+{
+  "Statement": {
+    "Effect": "Deny",
+    "Action": "sts:AssumeRole",
+    "Principal": "*"
+  }
+}

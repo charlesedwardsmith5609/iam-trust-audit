@@ -1,0 +1,7 @@
+{
+  "Statement": {
+    "Effect": "Allow",
+    "Action": "sts:*",
+    "Principal": {"AWS": "arn:aws:iam::111122223333:root"}
+  }
+}
